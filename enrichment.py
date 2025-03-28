@@ -4,6 +4,8 @@ import requests
 import re
 import socket
 import dns.resolver
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="Domain Enrichment Tool", layout="centered")
 st.title("🔍 Domain Enrichment & Validation Tool")
@@ -95,9 +97,19 @@ def fallback_guess(company, tlds):
             return d
     return None
 
+def enrich_row(i, row, tlds):
+    domain = clean_domain(row['organization_domain_1'])
+    if pd.isna(domain):
+        domain = guess_domain_clearbit(row['current_company'])
+    if pd.isna(domain) or not website_exists(domain):
+        domain = fallback_guess(row['current_company'], tlds)
+    valid = website_exists(domain)
+    is_not_microsoft_flag = is_not_microsoft(domain)
+    return i, domain, valid, is_not_microsoft_flag
+
 # --- UI ---
 country = st.selectbox("Select Country for Domain Guessing", list(country_tlds.keys()))
-uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+uploaded_file = st.file_uploader("Upload CSV with columns: profile_url, first_name, last_name, current_company, organization_domain_1", type=["csv"])
 
 tlds = country_tlds.get(country, [".com"])
 
@@ -108,20 +120,29 @@ if uploaded_file:
 
     required = ["profile_url", "first_name", "last_name", "current_company", "organization_domain_1"]
     df = df[[col for col in df.columns if col in required]]
-    df['organization_domain_1'] = df['organization_domain_1'].apply(clean_domain)
 
-    # Enrich missing domains
-    missing = df['organization_domain_1'].isna()
-    df.loc[missing, 'organization_domain_1'] = df.loc[missing, 'current_company'].apply(guess_domain_clearbit)
+    total = len(df)
+    progress = st.progress(0)
+    status_text = st.empty()
+    start_time = time.time()
 
-    # Fallback for unresolved domains
-    still_missing = df['organization_domain_1'].isna() | ~df['organization_domain_1'].apply(website_exists)
-    df.loc[still_missing, 'organization_domain_1'] = df.loc[still_missing, 'current_company'].apply(lambda x: fallback_guess(x, tlds))
+    results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(enrich_row, i, row, tlds) for i, row in df.iterrows()]
+        for n, future in enumerate(as_completed(futures)):
+            i, domain, valid, not_ms = future.result()
+            df.at[i, 'organization_domain_1'] = domain
+            df.at[i, 'domain_valid'] = valid
+            df.at[i, 'is_not_microsoft'] = not_ms
 
-    # Validate final domains
-    df['domain_valid'] = df['organization_domain_1'].apply(website_exists)
+            elapsed = time.time() - start_time
+            est_total_time = elapsed / (n + 1) * total
+            remaining_time = est_total_time - elapsed
+
+            progress.progress((n + 1) / total)
+            status_text.text(f"Processing {n + 1}/{total} rows | Elapsed: {int(elapsed)}s | ETA: {int(remaining_time)}s")
+
     df = df[df['domain_valid']].copy()
-    df['is_not_microsoft'] = df['organization_domain_1'].apply(is_not_microsoft)
     df.drop(columns=['domain_valid'], inplace=True)
 
     st.subheader("✅ Enriched Preview")
