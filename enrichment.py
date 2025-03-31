@@ -6,6 +6,7 @@ import socket
 import dns.resolver
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib3.exceptions import LocationParseError
 
 st.set_page_config(page_title="Domain Enrichment Tool", layout="centered")
 st.title("🔍 Domain Enrichment & Validation Tool")
@@ -52,6 +53,8 @@ def clean_domain(domain):
 def is_valid_domain(domain):
     if not domain or not isinstance(domain, str):
         return False
+    if len(domain) > 253 or '..' in domain:
+        return False
     return re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', domain) is not None
 
 def website_exists(domain):
@@ -62,7 +65,7 @@ def website_exists(domain):
             response = requests.head(f"{protocol}://{domain}", timeout=5, allow_redirects=True)
             if response.status_code < 400:
                 return True
-        except requests.RequestException:
+        except (requests.RequestException, LocationParseError):
             continue
     return False
 
@@ -91,23 +94,6 @@ def guess_domain_clearbit(company):
     except:
         return None
 
-def guess_domain_duckduckgo(company, country):
-    try:
-        query = f"{company} {country} official website"
-        url = f"https://api.duckduckgo.com/?q={requests.utils.quote(query)}&format=json"
-        r = requests.get(url)
-        if r.status_code == 200:
-            data = r.json()
-            domain = data.get("AbstractURL")
-            if domain:
-                return clean_domain(domain)
-            for topic in data.get("RelatedTopics", []):
-                if isinstance(topic, dict) and 'FirstURL' in topic:
-                    return clean_domain(topic['FirstURL'])
-        return None
-    except:
-        return None
-
 def fallback_guess(company, tlds):
     if not isinstance(company, str):
         return None
@@ -121,82 +107,78 @@ def fallback_guess(company, tlds):
 
 def enrich_row(i, row, tlds, country, counters):
     domain = clean_domain(row['organization_domain_1'])
+    source = 'existing'
     if pd.isna(domain):
         domain = guess_domain_clearbit(row['current_company'])
+        source = 'clearbit'
         if domain:
             counters['clearbit'] += 1
-    if pd.isna(domain):
-        domain = guess_domain_duckduckgo(row['current_company'], country)
-        if domain:
-            counters['duckduckgo'] += 1
     if pd.isna(domain) or not website_exists(domain):
         domain = fallback_guess(row['current_company'], tlds)
+        source = 'guessed'
         if domain:
             counters['guessed'] += 1
     valid = website_exists(domain)
     is_not_microsoft_flag = is_not_microsoft(domain)
-    return i, domain, valid, is_not_microsoft_flag
+    slow = False
+    start = time.time()
+    website_exists(domain)
+    if time.time() - start > 3:
+        slow = True
+    return i, domain, valid, is_not_microsoft_flag, source, slow
 
-# --- UI ---
-country = st.selectbox("Select Country for Domain Guessing", list(country_tlds.keys()))
-uploaded_file = st.file_uploader("Upload CSV with columns: profile_url, first_name, last_name, current_company, organization_domain_1", type=["csv"])
-
-tlds = country_tlds.get(country, [".com"])
+# --- UI: Main controls and download section ---
+country = st.selectbox("🌍 Select Country for Domain Guessing", list(country_tlds.keys()))
+uploaded_file = st.file_uploader("📤 Upload CSV with required columns", type=["csv"])
 
 if uploaded_file:
     try:
         df = pd.read_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"❌ Failed to read CSV file: {e}")
-    else:
-        st.subheader("📄 Original CSV Preview")
-        st.dataframe(df.head())
+        required_cols = ["profile_url", "first_name", "last_name", "current_company", "organization_domain_1"]
+        df = df[[col for col in df.columns if col in required_cols]]
+        tlds = country_tlds.get(country, [".com"])
 
-        required = ["profile_url", "first_name", "last_name", "current_company", "organization_domain_1"]
-        df = df[[col for col in df.columns if col in required]]
-
+        counters = {"clearbit": 0, "guessed": 0}
         total = len(df)
         progress = st.progress(0)
         status_text = st.empty()
         start_time = time.time()
 
-        counters = {"clearbit": 0, "duckduckgo": 0, "guessed": 0}
-
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(enrich_row, i, row, tlds, country, counters) for i, row in df.iterrows()]
             for n, future in enumerate(as_completed(futures)):
-                i, domain, valid, not_ms = future.result()
+                i, domain, valid, not_ms, source, slow = future.result()
                 df.at[i, 'organization_domain_1'] = domain
                 df.at[i, 'domain_valid'] = valid
                 df.at[i, 'is_not_microsoft'] = not_ms
+                df.at[i, 'source'] = source
+                df.at[i, 'slow_lookup'] = slow
 
                 elapsed = time.time() - start_time
                 est_total_time = elapsed / (n + 1) * total
                 remaining_time = est_total_time - elapsed
-
                 progress.progress((n + 1) / total)
                 status_text.text(f"Processing {n + 1}/{total} rows | Elapsed: {int(elapsed)}s | ETA: {int(remaining_time)}s")
 
-        df = df[df['domain_valid']].copy()
-        df.drop(columns=['domain_valid'], inplace=True)
+        st.session_state.df_enriched = df
 
-        st.subheader("✅ Enriched Preview")
-        st.dataframe(df.head())
+    except Exception as e:
+        st.error(f"❌ Failed to read or process CSV: {e}")
 
-        total_rows = len(df)
-        non_microsoft_rows = df['is_not_microsoft'].sum()
-        microsoft_rows = total_rows - non_microsoft_rows
+if 'df_enriched' in st.session_state:
+    df = st.session_state.df_enriched
+    filename = st.text_input("Enter filename for download (without extension)", "enriched_output")
 
-        st.markdown(f"**Total valid rows:** {total_rows}")
-        st.markdown(f"✅ Non-Microsoft domains: {non_microsoft_rows}")
-        st.markdown(f"❌ Microsoft domains: {microsoft_rows}")
-        st.markdown(f"🔎 Domains found via Clearbit: {counters['clearbit']}")
-        st.markdown(f"🦆 Domains found via DuckDuckGo: {counters['duckduckgo']}")
-        st.markdown(f"🧠 Domains generated by guessing: {counters['guessed']}")
+    df_valid = df[df['organization_domain_1'].notna() & df['organization_domain_1'].str.strip().ne('')]
+    df_failed = df[df['organization_domain_1'].isna() | df['organization_domain_1'].str.strip().eq('')]
+    df_non_ms = df_valid[df_valid['is_not_microsoft']]
 
-        filename = st.text_input("Enter filename for download (without extension)", "enriched_output")
+    st.markdown("### 📊 Enrichment Summary")
+    st.write(f"✅ Domains enriched: {len(df_valid)}")
+    st.write(f"❌ Domains not enriched: {len(df_failed)}")
+    st.write(f"📭 Non-Microsoft domains: {len(df_non_ms)}")
 
-        df_non_ms = df[df['is_not_microsoft']]
-
-        st.download_button("📥 Download FULL CSV", df.to_csv(index=False), file_name=f"{filename}_full.csv", mime="text/csv")
-        st.download_button("📥 Download NON-Microsoft only", df_non_ms.to_csv(index=False), file_name=f"{filename}_non_microsoft.csv", mime="text/csv")
+    st.markdown("### 📥 Downloads")
+    st.download_button("📄 Download Full List", df_valid.to_csv(index=False), file_name=f"{filename}_full.csv", mime="text/csv")
+    st.download_button("💡 Download Non-Microsoft Only", df_non_ms.to_csv(index=False), file_name=f"{filename}_non_microsoft.csv", mime="text/csv")
+    st.download_button("⚠️ Download Not Enriched", df_failed.to_csv(index=False), file_name=f"{filename}_not_enriched.csv", mime="text/csv")
