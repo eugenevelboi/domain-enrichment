@@ -49,8 +49,13 @@ def clean_domain(domain):
     domain = re.sub(r'^(www|careers|info|jobs|shop)\.', '', domain)
     return domain.strip().split('/')[0]
 
+def is_valid_domain(domain):
+    if not domain or not isinstance(domain, str):
+        return False
+    return re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', domain) is not None
+
 def website_exists(domain):
-    if not domain:
+    if not is_valid_domain(domain):
         return False
     for protocol in ['https', 'http']:
         try:
