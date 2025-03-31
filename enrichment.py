@@ -94,6 +94,21 @@ def guess_domain_clearbit(company):
     except:
         return None
 
+def guess_domain_opencorporates(company, country):
+    try:
+        query = f"https://api.opencorporates.com/v0.4/companies/search?q={company}&jurisdiction_code={country.lower()}"
+        r = requests.get(query)
+        if r.status_code == 200:
+            res = r.json()
+            companies = res.get("results", {}).get("companies", [])
+            for comp in companies:
+                url = comp.get("company", {}).get("homepage_url")
+                if url:
+                    return clean_domain(url)
+        return None
+    except:
+        return None
+
 def fallback_guess(company, tlds):
     if not isinstance(company, str):
         return None
@@ -113,6 +128,11 @@ def enrich_row(i, row, tlds, country, counters):
         source = 'clearbit'
         if domain:
             counters['clearbit'] += 1
+    if pd.isna(domain):
+        domain = guess_domain_opencorporates(row['current_company'], country)
+        source = 'opencorporates'
+        if domain:
+            counters['opencorporates'] += 1
     if pd.isna(domain) or not website_exists(domain):
         domain = fallback_guess(row['current_company'], tlds)
         source = 'guessed'
