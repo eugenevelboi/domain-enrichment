@@ -5,6 +5,7 @@ import re
 import socket
 import dns.resolver
 import time
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import LocationParseError
 
@@ -13,35 +14,22 @@ st.title("🔍 Domain Enrichment & Validation Tool")
 
 # --- Country & TLD mapping ---
 country_tlds = {
-    "USA": [".com", ".io", ".ai"],
-    "UK": [".co.uk", ".com", ".io", ".ai"],
-    "Canada": [".ca", ".com", ".io", ".ai"],
-    "Germany": [".de", ".com", ".io", ".ai"],
-    "France": [".fr", ".com", ".io", ".ai"],
-    "Netherlands": [".nl", ".com", ".io", ".ai"],
-    "Belgium": [".be", ".com", ".io", ".ai"],
-    "Sweden": [".se", ".com", ".io", ".ai"],
-    "Austria": [".at", ".com", ".io", ".ai"],
-    "Switzerland": [".ch", ".com", ".io", ".ai"],
-    "Denmark": [".dk", ".com", ".io", ".ai"],
-    "Finland": [".fi", ".com", ".io", ".ai"],
-    "Norway": [".no", ".com", ".io", ".ai"],
-    "Ireland": [".ie", ".com", ".io", ".ai"],
-    "Luxembourg": [".lu", ".com", ".io", ".ai"],
-    "Iceland": [".is", ".com", ".io", ".ai"],
-    "Spain": [".es", ".com", ".io", ".ai"],
-    "Singapore": [".sg", ".com", ".io", ".ai"],
-    "United Arab Emirates": [".ae", ".com", ".io", ".ai"],
-    "New Zealand": [".nz", ".com", ".io", ".ai"],
-    "South Africa": [".za", ".com", ".io", ".ai"],
-    "Japan": [".jp", ".com", ".io", ".ai"],
-    "Israel": [".il", ".com", ".io", ".ai"],
-    "South Korea": [".kr", ".com", ".io", ".ai"],
-    "Hong Kong": [".hk", ".com", ".io", ".ai"],
-    "Taiwan": [".tw", ".com", ".io", ".ai"]
+    "USA": [".com", ".io", ".ai"], "UK": [".co.uk", ".com", ".io", ".ai"],
+    "Canada": [".ca", ".com", ".io", ".ai"], "Germany": [".de", ".com", ".io", ".ai"],
+    "France": [".fr", ".com", ".io", ".ai"], "Netherlands": [".nl", ".com", ".io", ".ai"],
+    "Belgium": [".be", ".com", ".io", ".ai"], "Sweden": [".se", ".com", ".io", ".ai"],
+    "Austria": [".at", ".com", ".io", ".ai"], "Switzerland": [".ch", ".com", ".io", ".ai"],
+    "Denmark": [".dk", ".com", ".io", ".ai"], "Finland": [".fi", ".com", ".io", ".ai"],
+    "Norway": [".no", ".com", ".io", ".ai"], "Ireland": [".ie", ".com", ".io", ".ai"],
+    "Luxembourg": [".lu", ".com", ".io", ".ai"], "Iceland": [".is", ".com", ".io", ".ai"],
+    "Spain": [".es", ".com", ".io", ".ai"], "Singapore": [".sg", ".com", ".io", ".ai"],
+    "United Arab Emirates": [".ae", ".com", ".io", ".ai"], "New Zealand": [".nz", ".com", ".io", ".ai"],
+    "South Africa": [".za", ".com", ".io", ".ai"], "Japan": [".jp", ".com", ".io", ".ai"],
+    "Israel": [".il", ".com", ".io", ".ai"], "South Korea": [".kr", ".com", ".io", ".ai"],
+    "Hong Kong": [".hk", ".com", ".io", ".ai"], "Taiwan": [".tw", ".com", ".io", ".ai"]
 }
 
-# --- Functions ---
+# --- Utility Functions ---
 def clean_domain(domain):
     if pd.isna(domain):
         return None
@@ -74,9 +62,8 @@ def is_not_microsoft(domain):
         answers = dns.resolver.resolve(domain, 'MX')
         for rdata in answers:
             mx = str(rdata.exchange).lower()
-            if any(provider in mx for provider in [
-                'outlook.com', 'office365.com', 'microsoft.com',
-                'protection.outlook.com', 'mail.protection']):
+            if any(p in mx for p in ['outlook.com', 'office365.com', 'microsoft.com',
+                                     'protection.outlook.com', 'mail.protection']):
                 return False
         return True
     except:
@@ -147,18 +134,17 @@ def enrich_row(i, row, tlds, country, counters):
         slow = True
     return i, domain, valid, is_not_microsoft_flag, source, slow
 
-# --- UI: Main controls and download section ---
+# --- UI and Processing ---
 country = st.selectbox("🌍 Select Country for Domain Guessing", list(country_tlds.keys()))
 uploaded_file = st.file_uploader("📤 Upload CSV with required columns", type=["csv"])
 
-if uploaded_file:
+if uploaded_file and 'df_enriched' not in st.session_state:
     try:
-        df = pd.read_csv(uploaded_file)
-        required_cols = ["profile_url", "first_name", "last_name", "current_company", "organization_domain_1"]
+        df = pd.read_csv(uploaded_file, on_bad_lines='skip')
+        required_cols = ["profile_url", "first_name", "last_name", "current_company", "organization_domain_1", "current_company_position"]
         df = df[[col for col in df.columns if col in required_cols]]
         tlds = country_tlds.get(country, [".com"])
-
-        counters = {"clearbit": 0, "guessed": 0}
+        counters = {"clearbit": 0, "guessed": 0, "opencorporates": 0}
         total = len(df)
         progress = st.progress(0)
         status_text = st.empty()
@@ -181,13 +167,16 @@ if uploaded_file:
                 status_text.text(f"Processing {n + 1}/{total} rows | Elapsed: {int(elapsed)}s | ETA: {int(remaining_time)}s")
 
         st.session_state.df_enriched = df
+        st.session_state.counters = counters
 
     except Exception as e:
         st.error(f"❌ Failed to read or process CSV: {e}")
 
+# --- Result View and Downloads ---
 if 'df_enriched' in st.session_state:
     df = st.session_state.df_enriched
-    filename = st.text_input("Enter filename for download (without extension)", "enriched_output")
+    counters = st.session_state.get('counters', {})
+    uploaded_filename = os.path.splitext(uploaded_file.name)[0] if uploaded_file else "enriched"
 
     df_valid = df[df['organization_domain_1'].notna() & df['organization_domain_1'].str.strip().ne('')]
     df_failed = df[df['organization_domain_1'].isna() | df['organization_domain_1'].str.strip().eq('')]
@@ -197,8 +186,10 @@ if 'df_enriched' in st.session_state:
     st.write(f"✅ Domains enriched: {len(df_valid)}")
     st.write(f"❌ Domains not enriched: {len(df_failed)}")
     st.write(f"📭 Non-Microsoft domains: {len(df_non_ms)}")
+    st.write(f"🔎 Clearbit: {counters.get('clearbit', 0)} | 🧾 OpenCorporates: {counters.get('opencorporates', 0)} | 🧠 Guessed: {counters.get('guessed', 0)}")
 
     st.markdown("### 📥 Downloads")
-    st.download_button("📄 Download Full List", df_valid.to_csv(index=False), file_name=f"{filename}_full.csv", mime="text/csv")
-    st.download_button("💡 Download Non-Microsoft Only", df_non_ms.to_csv(index=False), file_name=f"{filename}_non_microsoft.csv", mime="text/csv")
-    st.download_button("⚠️ Download Not Enriched", df_failed.to_csv(index=False), file_name=f"{filename}_not_enriched.csv", mime="text/csv")
+    st.download_button("📄 Download Full List", df_valid.to_csv(index=False), file_name=f"{uploaded_filename}_enriched_full.csv", mime="text/csv")
+    st.download_button("💡 Download Non-Microsoft Only", df_non_ms.to_csv(index=False), file_name=f"{uploaded_filename}_enriched_non_microsoft.csv", mime="text/csv")
+    st.download_button("⚠️ Download Not Enriched", df_failed.to_csv(index=False), file_name=f"{uploaded_filename}_enriched_not_enriched.csv", mime="text/csv")
+
